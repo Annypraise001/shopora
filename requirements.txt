@@ -5,13 +5,4 @@ PyJWT==2.15.1
 pwdlib==0.3.1
 python-dotenv==1.2.4
 email-validator
-# Old backup files
-main backup.py
-main _backup_checkout.py
-main_before_role_access.py
-models_before_role_access.py
-frontend/src/App_backup*.tsx
-
-# Local comparison notes
-database_comparison.txt
-backend_routes.txt
+psycopg[binary]
