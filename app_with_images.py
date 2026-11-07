@@ -1,105 +1,59 @@
 
-"""
-SHOPORA CLOUDINARY IMAGE SERVICE
+"""Shopora Cloudinary product images.
 
 Copyright (c) 2026 Computer Software Group 1.
-All rights reserved.
 
-Cloudinary Cloud Name: obpyhqy1
-
-Extends the existing Shopora FastAPI application
-with seller-owned product photo uploads.
-
-Render Start Command:
+Run with:
 uvicorn app_with_images:app --host 0.0.0.0 --port $PORT
 """
 
 import io
+import logging
 import os
 
 import cloudinary
 import cloudinary.uploader
 
 from fastapi import (
+    APIRouter,
     Depends,
     File,
     HTTPException,
     UploadFile,
 )
-
 from fastapi.responses import RedirectResponse
-
-from PIL import (
-    Image,
-    UnidentifiedImageError,
-)
-
-from sqlalchemy import (
-    Column,
-    ForeignKey,
-    Integer,
-    String,
-)
-
+from PIL import Image, UnidentifiedImageError
+from sqlalchemy import Column, ForeignKey, Integer, String
+from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
 import main as shopora_backend
 import models
+from database import Base, SessionLocal, engine
 
-from database import (
-    Base,
-    SessionLocal,
-    engine,
-)
+logger = logging.getLogger(__name__)
 
-
-# ====================================================
-# EXISTING SHOPORA FASTAPI APP
-# ====================================================
-
-# IMPORTANT:
-# Uvicorn looks for this exact variable.
-# Keep it at module level.
-
+# Reuse your original Shopora application.
 app = shopora_backend.app
 
-
-# ====================================================
-# CLOUDINARY CONFIGURATION
-# ====================================================
-
-CLOUDINARY_URL = os.getenv(
-    "CLOUDINARY_URL",
-    "",
-).strip()
-
-CLOUDINARY_CLOUD_NAME = "obpyhqy1"
+# Register image routes together.
+router = APIRouter()
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-
-ALLOWED_FORMATS = {
-    "JPEG",
-    "PNG",
-    "WEBP",
-}
-
-if CLOUDINARY_URL:
-    cloudinary.config(secure=True)
+MAX_PIXELS = 25_000_000
+ACCEPTED_FORMATS = {"JPEG", "PNG", "WEBP"}
 
 
-# ====================================================
-# PRODUCT PHOTOGRAPHS DATABASE TABLE
-# ====================================================
+# ============================================================
+# DATABASE MODEL
+# ============================================================
 
 class ProductPhoto(Base):
     __tablename__ = "product_photos"
 
     product_id = Column(
         Integer,
-        ForeignKey(
-            "products.id",
-            ondelete="CASCADE",
-        ),
+        ForeignKey("products.id", ondelete="CASCADE"),
         primary_key=True,
     )
 
@@ -114,111 +68,108 @@ class ProductPhoto(Base):
     )
 
 
-# Create only the new image table.
-# Existing product and account data is preserved.
+# ============================================================
+# IMAGE VALIDATION
+# ============================================================
 
-Base.metadata.create_all(
-    bind=engine,
-    tables=[ProductPhoto.__table__],
-)
-
-
-# ====================================================
-# VALIDATE PRODUCT PHOTO
-# ====================================================
-
-def validate_image(raw: bytes):
-    if not raw:
+def validate_image(content: bytes) -> None:
+    if not content:
         raise HTTPException(
             status_code=422,
             detail="Image file is empty.",
         )
 
-    if len(raw) > MAX_IMAGE_BYTES:
+    if len(content) > MAX_IMAGE_BYTES:
         raise HTTPException(
             status_code=413,
             detail="Maximum image size is 5 MB.",
         )
 
     try:
-        with Image.open(io.BytesIO(raw)) as image:
-            image.verify()
+        with Image.open(io.BytesIO(content)) as picture:
+            picture.verify()
 
-        with Image.open(io.BytesIO(raw)) as image:
-            image_format = image.format
-            width, height = image.size
+        with Image.open(io.BytesIO(content)) as picture:
+            image_format = picture.format
+            width, height = picture.size
 
     except (
         UnidentifiedImageError,
         Image.DecompressionBombError,
         OSError,
         ValueError,
-    ):
+    ) as exc:
         raise HTTPException(
             status_code=422,
             detail="Invalid image file.",
-        )
+        ) from exc
 
-    if image_format not in ALLOWED_FORMATS:
+    if image_format not in ACCEPTED_FORMATS:
         raise HTTPException(
             status_code=422,
             detail="Only JPG, PNG and WebP are supported.",
         )
 
-    if width <= 0 or height <= 0:
+    if (
+        width < 1
+        or height < 1
+        or width * height > MAX_PIXELS
+    ):
         raise HTTPException(
             status_code=422,
-            detail="Invalid image dimensions.",
-        )
-
-    if width * height > 25_000_000:
-        raise HTTPException(
-            status_code=422,
-            detail="Image resolution is too large.",
+            detail="Invalid or oversized image dimensions.",
         )
 
 
-# ====================================================
-# UPLOAD TO CLOUDINARY
-# ====================================================
+# ============================================================
+# CLOUDINARY UPLOAD
+# ============================================================
 
-def upload_cloudinary(raw: bytes):
+def send_to_cloudinary(content: bytes) -> dict:
     try:
         result = cloudinary.uploader.upload(
-            raw,
+            content,
             resource_type="image",
             folder="shopora/products",
             overwrite=False,
         )
 
     except Exception as exc:
+        logger.exception("Cloudinary upload failed")
+
         raise HTTPException(
             status_code=502,
-            detail="Cloudinary upload failed.",
+            detail="Cloudinary upload failed; check Render logs.",
         ) from exc
 
-    image_url = result.get("secure_url")
+    url = result.get("secure_url")
     public_id = result.get("public_id")
 
     if (
-        not isinstance(image_url, str)
-        or not image_url.startswith("https://")
+        not isinstance(url, str)
+        or not url.startswith("https://res.cloudinary.com/")
         or not isinstance(public_id, str)
         or not public_id
     ):
         raise HTTPException(
             status_code=502,
-            detail="Cloudinary returned an invalid response.",
+            detail="Cloudinary returned invalid image details.",
         )
 
-    return image_url, public_id
+    return {
+        "image_url": url,
+        "public_id": public_id,
+    }
 
 
-# ====================================================
-# SELLER IMAGE UPLOAD ROUTE
-# ====================================================
+# ============================================================
+# POST — UPLOAD PRODUCT IMAGE
+# ============================================================
 
-@app.post("/seller/products/{product_id}/image")
+@router.post(
+    "/seller/products/{product_id}/image",
+    tags=["Product Images"],
+)
 async def upload_product_image(
     product_id: int,
     image: UploadFile = File(...),
@@ -226,104 +177,97 @@ async def upload_product_image(
         shopora_backend.get_current_seller
     ),
 ):
-    if not CLOUDINARY_URL:
+    if not os.getenv("CLOUDINARY_URL", "").strip():
         raise HTTPException(
             status_code=503,
-            detail="Cloudinary is not configured.",
+            detail="CLOUDINARY_URL is missing on Render.",
         )
 
     db = SessionLocal()
 
     try:
-        product = (
-            db.query(models.Product)
-            .filter(
-                models.Product.id == product_id,
-                models.Product.seller_id == seller["id"],
-            )
-            .first()
-        )
+        # Only the product's seller can upload its photo.
+        product = db.query(models.Product).filter(
+            models.Product.id == product_id,
+            models.Product.seller_id == seller["id"],
+        ).first()
 
         if product is None:
             raise HTTPException(
                 status_code=404,
-                detail=(
-                    "Product not found or not owned "
-                    "by this seller."
-                ),
+                detail="Product not found in your seller account.",
             )
 
-        raw = await image.read(
-            MAX_IMAGE_BYTES + 1
+        content = await image.read(MAX_IMAGE_BYTES + 1)
+
+        validate_image(content)
+
+        uploaded = await run_in_threadpool(
+            send_to_cloudinary,
+            content,
         )
 
-        validate_image(raw)
-
-        image_url, public_id = await run_in_threadpool(
-            upload_cloudinary,
-            raw,
-        )
-
-        photo = db.get(
-            ProductPhoto,
-            product_id,
-        )
+        record = db.get(ProductPhoto, product_id)
 
         old_public_id = (
-            photo.public_id
-            if photo is not None
-            else None
+            record.public_id if record else None
         )
 
-        if photo is None:
-            photo = ProductPhoto(
+        if record is None:
+            record = ProductPhoto(
                 product_id=product_id,
-                image_url=image_url,
-                public_id=public_id,
+                **uploaded,
             )
-
-            db.add(photo)
+            db.add(record)
 
         else:
-            photo.image_url = image_url
-            photo.public_id = public_id
+            record.image_url = uploaded["image_url"]
+            record.public_id = uploaded["public_id"]
 
         try:
             db.commit()
 
-        except Exception:
+        except SQLAlchemyError as exc:
             db.rollback()
 
+            # Remove the new Cloudinary image if
+            # the database could not save it.
             try:
                 await run_in_threadpool(
                     cloudinary.uploader.destroy,
-                    public_id,
+                    uploaded["public_id"],
                 )
+
             except Exception:
-                pass
+                logger.exception(
+                    "Failed to clean up orphan Cloudinary upload"
+                )
 
             raise HTTPException(
                 status_code=500,
-                detail="Unable to save product image.",
-            )
+                detail="Could not save image to the database.",
+            ) from exc
 
+        # Remove the old image after replacement.
         if (
             old_public_id
-            and old_public_id != public_id
+            and old_public_id != uploaded["public_id"]
         ):
             try:
                 await run_in_threadpool(
                     cloudinary.uploader.destroy,
                     old_public_id,
                 )
+
             except Exception:
-                pass
+                logger.exception(
+                    "Could not remove replaced image"
+                )
 
         return {
             "success": True,
-            "message": "Photo uploaded successfully.",
             "product_id": product_id,
-            "image_url": image_url,
+            "image_url": uploaded["image_url"],
         }
 
     finally:
@@ -331,28 +275,31 @@ async def upload_product_image(
         db.close()
 
 
-# ====================================================
-# GET PRODUCT PHOTO
-# ====================================================
+# ============================================================
+# GET — DISPLAY PRODUCT IMAGE
+# ============================================================
 
-@app.get("/products/{product_id}/image")
+@router.get(
+    "/products/{product_id}/image",
+    tags=["Product Images"],
+)
 def get_product_image(product_id: int):
     db = SessionLocal()
 
     try:
-        photo = db.get(
+        record = db.get(
             ProductPhoto,
             product_id,
         )
 
-        if photo is None:
+        if record is None:
             raise HTTPException(
                 status_code=404,
-                detail="No photo found for this product.",
+                detail="No image uploaded for this product.",
             )
 
         return RedirectResponse(
-            url=photo.image_url,
+            record.image_url,
             status_code=307,
         )
 
@@ -360,23 +307,52 @@ def get_product_image(product_id: int):
         db.close()
 
 
-# ====================================================
-# IMAGE UPLOAD STATUS
-# ====================================================
+# ============================================================
+# GET — CLOUDINARY STATUS
+# ============================================================
 
-@app.get("/image-upload/status")
+@router.get(
+    "/image-upload/status",
+    tags=["Product Images"],
+)
 def image_upload_status():
-    configured = bool(CLOUDINARY_URL)
+    configured = bool(
+        os.getenv("CLOUDINARY_URL", "").strip()
+    )
 
     return {
-        "service": "Shopora Cloudinary Images",
         "status": (
-            "ready"
-            if configured
-            else "unconfigured"
+            "ready" if configured else "unconfigured"
         ),
-        "cloud_name": CLOUDINARY_CLOUD_NAME,
         "cloudinary_configured": configured,
+        "upload_endpoint": "/seller/products/{product_id}/image",
+        "upload_method": "POST",
         "max_upload_mb": 5,
     }
 
+
+# ============================================================
+# INITIALIZE IMAGE TABLE
+# ============================================================
+
+# Creates only the new table if absent.
+# Existing Shopora product data is not deleted.
+Base.metadata.create_all(
+    bind=engine,
+    tables=[ProductPhoto.__table__],
+)
+
+
+# ============================================================
+# REGISTER IMAGE ROUTES
+# ============================================================
+
+app.include_router(router)
+
+
+# Verify that the POST endpoint was registered.
+assert any(
+    route.path == "/seller/products/{product_id}/image"
+    and "POST" in (getattr(route, "methods", set()) or set())
+    for route in app.routes
+), "Shopora product image POST route was not registered"
