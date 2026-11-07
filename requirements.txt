@@ -1,3 +1,6 @@
+cloudinary
+Pillow
+python-multipart
 fastapi==0.162.0
 uvicorn==0.54.0
 SQLAlchemy==2.1.6
